@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2024-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -28,6 +28,7 @@
 #include <time.h>
 #include <errno.h>
 #include <assert.h>
+#include <fcntl.h>
 
 #include <GL/gl.h>
 
@@ -135,6 +136,12 @@ typedef struct
      * Note that currently, this is only used for PRIME buffers.
      */
     int fd;
+
+    /**
+     * A duplicate of the sync file descriptor that can be used for waiting.
+     * Will be -1 when not in use.
+     */
+    int dup_sync_fd;
 
     /**
      * A timeline sync object.
@@ -307,6 +314,12 @@ static void FreeColorBuffer(X11DisplayInstance *inst, X11ColorBuffer *buffer)
 {
     if (buffer != NULL)
     {
+        // Close any duplicated sync FD
+        if (buffer->dup_sync_fd >= 0) {
+            close(buffer->dup_sync_fd);
+            buffer->dup_sync_fd = -1;
+        }
+
         if (buffer->gbo != NULL)
         {
             gbm_bo_destroy(buffer->gbo);
@@ -358,6 +371,9 @@ static X11ColorBuffer *AllocOneColorBuffer(X11DisplayInstance *inst,
     {
         return NULL;
     }
+
+    // Initialize the duplicate sync FD to -1 (invalid)
+    buffer->dup_sync_fd = -1;
 
     glvnd_list_init(&buffer->entry);
     buffer->fd = -1;
@@ -418,8 +434,11 @@ static X11ColorBuffer *AllocatePrimeBuffer(X11DisplayInstance *inst,
         return NULL;
     }
 
+    // Initialize the duplicate sync FD to -1 (invalid)
+    buffer->dup_sync_fd = -1;
+
     glvnd_list_init(&buffer->entry);
-    buffer->fd = -1;
+    buffer->status = BUFFER_STATUS_IDLE;
 
     buffer->buffer = inst->platform->priv->egl.PlatformAllocColorBufferNVX(inst->internal_display->edpy,
                 width, height, fourcc, DRM_FORMAT_MOD_LINEAR, EGL_TRUE);
@@ -1602,6 +1621,12 @@ static EGLBoolean SyncRendering(EplDisplay *pdpy, EplSurface *surf, X11ColorBuff
     EGLSync sync = EGL_NO_SYNC;
     EGLBoolean success = EGL_FALSE;
 
+    // Initialize the duplicate FD to -1 (invalid)
+    if (buffer->dup_sync_fd >= 0) {
+        close(buffer->dup_sync_fd);
+        buffer->dup_sync_fd = -1;
+    }
+
     if (!pwin->inst->supports_EGL_ANDROID_native_fence_sync)
     {
         // If we don't have EGL_ANDROID_native_fence_sync, then we can't do
@@ -1626,6 +1651,8 @@ static EGLBoolean SyncRendering(EplDisplay *pdpy, EplSurface *surf, X11ColorBuff
         goto done;
     }
 
+    // Create a duplicate of the sync FD for later use
+    buffer->dup_sync_fd = dup(syncFd);
     if (pwin->use_explicit_sync)
     {
         // If we support explicit sync, then always use that.
@@ -1680,22 +1707,29 @@ done:
 static EGLBoolean WaitForSyncFDGPU(X11DisplayInstance *inst, int syncfd)
 {
     EGLBoolean success = EGL_FALSE;
+    EGLSync sync;
+    const EGLAttrib syncAttribs[] =
+    {
+        EGL_SYNC_NATIVE_FENCE_FD_ANDROID, syncfd,
+        EGL_NONE
+    };
 
     if (syncfd >= 0)
     {
-        const EGLAttrib syncAttribs[] =
-        {
-            EGL_SYNC_NATIVE_FENCE_FD_ANDROID, syncfd,
-            EGL_NONE
-        };
-        EGLSync sync = inst->platform->priv->egl.CreateSync(inst->internal_display->edpy,
+        // Check if the syncfd is valid
+        if (fcntl(syncfd, F_GETFD) == -1) {
+        }
+
+        sync = inst->platform->priv->egl.CreateSync(inst->internal_display->edpy,
                 EGL_SYNC_NATIVE_FENCE_ANDROID, syncAttribs);
         if (sync != EGL_NO_SYNC)
         {
             success = inst->platform->priv->egl.WaitSync(inst->internal_display->edpy, sync, 0);
+
             inst->platform->priv->egl.DestroySync(inst->internal_display->edpy, sync);
         }
     }
+
     return success;
 }
 
@@ -1706,11 +1740,25 @@ static EGLBoolean WaitImplicitFence(EplDisplay *pdpy, X11ColorBuffer *buffer)
 
     assert(pdpy->priv->inst->supports_implicit_sync);
 
-    fd = eplX11ExportDmaBufSyncFile(pdpy->priv->inst, buffer->fd);
-    if (fd >= 0)
-    {
-        success = WaitForSyncFDGPU(pdpy->priv->inst, fd);
-        close(fd);
+    // Check if we have a duplicated sync fd from before
+    if (buffer->dup_sync_fd >= 0) {
+        // Verify it's still valid
+        if (fcntl(buffer->dup_sync_fd, F_GETFD) != -1) {
+            success = WaitForSyncFDGPU(pdpy->priv->inst, buffer->dup_sync_fd);
+            close(buffer->dup_sync_fd);
+        }
+
+        buffer->dup_sync_fd = -1;
+    }
+
+    // If we don't have a duplicated fd or it failed, try the normal path
+    if (!success) {
+        fd = eplX11ExportDmaBufSyncFile(pdpy->priv->inst, buffer->fd);
+        if (fd >= 0)
+        {
+            success = WaitForSyncFDGPU(pdpy->priv->inst, fd);
+            close(fd);
+        }
     }
 
     if (success)
@@ -1865,15 +1913,29 @@ static int CheckBufferReleaseNoSync(EplDisplay *pdpy, EplSurface *surf,
  *
  * This will attempt to use eglWaitSync to let the GPU wait on the sync point,
  * but if that fails, then it'll fall back to a CPU wait.
+ *
+ * @param inst The X11DisplayInstance
+ * @param buffer The X11ColorBuffer containing the duplicated sync fd
+ * @param timeline The timeline to wait on
  */
-static EGLBoolean WaitTimelinePoint(X11DisplayInstance *inst, X11Timeline *timeline)
+static EGLBoolean WaitTimelinePoint(X11DisplayInstance *inst, X11ColorBuffer *buffer, X11Timeline *timeline)
 {
-    int syncfd = eplX11TimelinePointToSyncFD(inst, timeline);
     EGLBoolean success = EGL_FALSE;
 
-    if (syncfd >= 0)
-    {
-        success = WaitForSyncFDGPU(inst, syncfd);
+    // Use the duplicated FD if available, otherwise extract one from the timeline
+    if (buffer && buffer->dup_sync_fd >= 0) {
+        success = WaitForSyncFDGPU(inst, buffer->dup_sync_fd);
+        // Don't close the dup_sync_fd here - it will be handled in WaitImplicitFence or elsewhere
+    } else {
+        // Fallback to old behavior
+        int syncfd = eplX11TimelinePointToSyncFD(inst, timeline);
+
+        if (syncfd >= 0)
+        {
+            success = WaitForSyncFDGPU(inst, syncfd);
+            // Always close the syncfd we got from eplX11TimelinePointToSyncFD
+            close(syncfd);
+        }
     }
 
     if (!success)
@@ -1993,7 +2055,7 @@ static int CheckBufferReleaseExplicit(EplDisplay *pdpy, EplSurface *surf,
     else if (ret == 0)
     {
         assert(first < count);
-        if (WaitTimelinePoint(pwin->inst, &buffers[first]->timeline))
+        if (WaitTimelinePoint(pwin->inst, buffers[first], &buffers[first]->timeline))
         {
             buffers[first]->status = BUFFER_STATUS_IDLE;
             return count;
