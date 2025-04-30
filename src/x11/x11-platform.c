@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2024-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -1126,9 +1126,14 @@ X11DisplayInstance *eplX11DisplayInstanceCreate(EplDisplay *pdpy, EGLBoolean fro
             inst->supports_prime = EGL_TRUE;
         }
 
-        if (eplFindExtension("EGL_ANDROID_native_fence_sync", extensions))
+        if (eplFindExtension("EGL_ANDROID_native_fence_sync", extensions)
+                && pdpy->platform->priv->egl.DupNativeFenceFDANDROID != NULL)
         {
             inst->supports_EGL_ANDROID_native_fence_sync = EGL_TRUE;
+        }
+        else
+        {
+            inst->supports_EGL_ANDROID_native_fence_sync = EGL_FALSE;
         }
     }
 
@@ -1356,6 +1361,15 @@ static void eplX11SetImportSyncFileUnsupported(void)
 EGLBoolean eplX11ImportDmaBufSyncFile(X11DisplayInstance *inst, int dmabuf, int syncfd)
 {
     EGLBoolean ret = EGL_FALSE;
+
+    // Validate both input FDs
+    if (fcntl(dmabuf, F_GETFD) == -1) {
+        return EGL_FALSE;
+    }
+
+    if (fcntl(syncfd, F_GETFD) == -1) {
+        return EGL_FALSE;
+    }
 
     if (inst->supports_implicit_sync && eplX11CheckImportSyncFileSupported())
     {
